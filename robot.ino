@@ -1,0 +1,658 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <MPU6050.h>
+#include <math.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+
+// Motor pins
+const int motor1Pin1 = 23;
+const int motor1Pin2 = 22;
+const int motor2Pin1 = 21;
+const int motor2Pin2 = 19;
+const int ena=2;
+const int enb=15;
+
+Servo myServo;
+const int servoPin = 26;  // Connect your servo signal pin here
+
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);  // Use UART1 on ESP32
+
+#define RXD2 16
+#define TXD2 17
+
+// hc-sr04
+#define TRIG_PIN 33
+#define ECHO_PIN 25
+#define MAX_DISTANCE_CM 400.0
+#define MIN_VALID_DISTANCE_CM 2.0
+unsigned long obstacleCheckInterval = 100; // Check every 100 ms
+unsigned long lastObstacleCheck = 0;
+// kalman filter 
+class Kalman {
+  public:
+    Kalman(float q = 0.125, float r = 4, float p = 1, float initial_value = 0) {
+      this->q = q;
+      this->r = r;
+      this->p = p;
+      this->x = initial_value;
+    }
+
+    float filter(float measurement) {
+      // prediction update
+      p = p + q;
+
+      // measurement update
+      float k = p / (p + r);
+      x = x + k * (measurement - x);
+      p = (1 - k) * p;
+
+      return x;
+    }
+
+  private:
+    float q; // process noise covariance
+    float r; // measurement noise covariance
+    float p; // estimation error covariance
+    float x; // value
+};
+Kalman kalman;
+Kalman kalmanDist; 
+
+
+// motor speed 
+int speed1=200;
+int speed2=200;
+
+// DHT Sensor settings
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// MQ2 settings
+const int mq2Pin = 34;
+// moisture pin 
+const int moisturePin = 32;
+int moistureValue;
+// LDR settings
+const int ldrPin = 35;
+
+// Wi-Fi credentials
+const char* ssid = "Prakash 2g";
+const char* password = "P1rakash@*#1";
+
+WebServer server(80);
+MPU6050 mpu;
+
+// Timer variables
+unsigned long lastSensorReadTime = 0;
+const unsigned long sensorReadInterval = 800; // 100 ms
+float lastTime = 0; // Last time the loop was executed
+
+// Sensor data structure
+struct SensorData {
+  float temperature;
+  float humidity;
+  int mq2Value;
+  int ldrValue;
+  int moisture;
+  float latitude;
+  float longitude;
+  float pitch;
+  float roll;
+  float yaw;
+};
+
+SensorData sensorData;
+
+void setup() {
+  Serial.begin(115200);
+  myServo.attach(servoPin);
+  server.on("/servo", HTTP_GET, []() {
+  String dir = server.arg("dir");
+  if (dir == "down") {
+    servo_down();
+    server.send(200, "text/plain", "Moved Down");
+  } else if (dir == "up") {
+    servo_up();
+    server.send(200, "text/plain", "Moved Up");
+  } else {
+    server.send(400, "text/plain", "Invalid Command");
+  }
+});
+  // Initialize motors
+  pinMode(motor1Pin1, OUTPUT);
+  pinMode(motor1Pin2, OUTPUT);
+  pinMode(motor2Pin1, OUTPUT);
+  pinMode(motor2Pin2, OUTPUT);
+  pinMode(ena,OUTPUT);
+  pinMode(enb,OUTPUT);
+  // distance pin setup
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  // Initialize DHT sensor
+  dht.begin();
+  // gps value 
+   gpsSerial.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(100);
+  }
+  Serial.println("Connected to WiFi");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Initialize I2C for MPU6050
+  Wire.begin(18, 5);
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed");
+  }
+
+  // Define web server routes
+  server.on("/forward", HTTP_GET, moveForward);
+  server.on("/backward", HTTP_GET, moveBackward);
+  server.on("/left", HTTP_GET, turnLeft);
+  server.on("/right", HTTP_GET, turnRight);
+  server.on("/stop", HTTP_GET, stop);
+  server.on("/getSensorData", HTTP_GET, getSensorData);
+  server.on("/setSpeed1", HTTP_GET, setSpeed1);
+  server.on("/setSpeed2", HTTP_GET, setSpeed2);
+  server.on("/",handleRoot);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastSensorReadTime >= sensorReadInterval) {
+    updateSensorData();
+    lastSensorReadTime = millis();
+  }
+
+  checkObstacleAndStop(); // 👈 call added here
+}
+
+
+void updateSensorData() {
+  // Read the value from the LDR
+  sensorData.ldrValue = analogRead(ldrPin);
+  // read moisture value
+  sensorData.moisture=analogRead(moisturePin);
+  // Read the value from the MQ-2 sensor
+  sensorData.mq2Value = analogRead(mq2Pin);
+  
+  // Read DHT sensor readings
+  sensorData.temperature = dht.readTemperature();
+  sensorData.humidity = dht.readHumidity();
+    // ---- [ GPS READING ] ----
+if (gps.location.isValid()) {
+    sensorData.latitude = gps.location.lat();
+    sensorData.longitude = gps.location.lng();
+} else {
+    sensorData.latitude = 0;
+    sensorData.longitude = 0;
+}
+  // Check if any reads failed
+  if (isnan(sensorData.humidity) || isnan(sensorData.temperature)) {
+    Serial.println("Failed to read from DHT sensor!");
+    return;  // Exit if reading fails
+  }
+  
+  // Read accelerometer and gyroscope values
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  
+  // Calculate pitch and roll from accelerometer
+  sensorData.pitch = atan2(ay, az) * 180.0 / M_PI;
+  sensorData.roll = atan2(ax, az) * 180.0 / M_PI;
+
+  // Simple integration of yaw
+  float currentTime = millis();
+  float dt = (currentTime - lastTime) / 1000;  // Convert to seconds
+  sensorData.yaw += (gz / 131.0) * dt;  // Update yaw
+  lastTime = currentTime;
+}
+
+// Handle root request
+void handleRoot() {
+  server.send(200, "text/html", R"rawliteral(
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NATERIDA</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Courier New', monospace;
+            background-color: #000;
+            background-image: linear-gradient(to right, rgba(255, 0, 0, 0.2), rgba(0, 255, 0, 0.2), rgba(0, 0, 255, 0.2));
+            background-size: 200% 200%;
+            animation: gradientAnimation 8s ease infinite;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            height: 100vh;
+            overflow-y: auto;
+            text-shadow: 0 0 20px rgba(255, 255, 255, 0.8);
+        }
+
+        @keyframes gradientAnimation {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            margin: 20px 0;
+            flex-direction: column;
+        }
+
+        h1 {
+            font-size: 3em;
+            animation: flicker 1s infinite;
+            margin: 0;
+            color: #00ff00;
+        }
+
+        @keyframes flicker {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+
+        .footer {
+            font-size: 1em;
+            animation: hackerEffect 1s infinite;
+            color: #00ffff;
+        }
+
+        @keyframes hackerEffect {
+            0%, 100% { opacity: 0.8; }
+            50% { opacity: 1; }
+        }
+
+        .button {
+            background-color: rgba(0, 0, 0, 0.8);
+            border: 2px solid #00ff00;
+            color: #00ff00;
+            padding: 15px 25px;
+            margin: 5px;
+            transition: background-color 0.4s, transform 0.4s, box-shadow 0.4s;
+            cursor: pointer;
+            border-radius: 12px;
+            box-shadow: 0 0 15px #00ff00, 0 0 30px #00ff00, 0 0 45px #00ff00;
+            font-size: 1.5em;
+            min-width: 100px;
+            animation: pulse 1s infinite alternate;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            100% { transform: scale(1.1); }
+        }
+
+        .button:hover {
+            background-color: rgba(0, 255, 0, 0.5);
+            transform: scale(1.1);
+            box-shadow: 0 0 25px #00ff00, 0 0 50px #00ff00, 0 0 75px #00ff00;
+        }
+
+        .control-container {
+            border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 10px;
+            text-align: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+
+        #cube-container {
+            margin: 10px;
+            border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+
+        #cube {
+            width: 80px;
+            height: 80px;
+            background: rgba(255, 165, 0, 0.7);
+            position: relative;
+            transform-style: preserve-3d;
+            transition: transform 0.1s;
+            box-shadow: 0 0 20px rgba(255, 165, 0, 0.7);
+        }
+
+        .face {
+            position: absolute;
+            width: 80px;
+            height: 80px;
+            background: rgba(255, 0, 0, 0.7);
+            border: 1px solid #fff;
+        }
+
+        .front { transform: translateZ(40px); }
+        .back { transform: rotateY(180deg) translateZ(40px); }
+        .left { transform: rotateY(-90deg) translateZ(40px); }
+        .right { transform: rotateY(90deg) translateZ(40px); }
+        .top { transform: rotateX(90deg) translateZ(40px); }
+        .bottom { transform: rotateX(-90deg) translateZ(40px); }
+
+        #angles { margin-top: 10px; font-size: 1.2em; color: #00ff00; }
+        #sensor-data { margin-top: 10px; font-size: 1em; text-align: center; color: #00ff00; width: 90%; }
+        .sensor-title { font-weight: bold; margin-bottom: 10px; animation: fadeIn 1s; }
+
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        
+        .sensor-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .sensor-table th, .sensor-table td {
+            border: 2px solid #00ff00;
+            padding: 10px;
+            text-align: center;
+            background-color: rgba(0, 255, 0, 0.2);
+        }
+
+        footer { position: absolute; bottom: 10px; }
+        
+        .direction-buttons {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+        }
+
+        .direction-buttons .button-row {
+            display: flex;
+            justify-content: center;
+            flex-direction: row;
+        }
+
+        @media (max-width: 600px) {
+            h1 { font-size: 2.5em; }
+            .button { font-size: 1em; }
+            #angles { font-size: 1em; }
+        }
+        #speed-inputs{
+           border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 10px;
+            text-align: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+        #morse-code{
+            border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 10px;
+            text-align: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+    </style>
+    <script>
+        setInterval(function() {
+            fetch('/getSensorData').then(response => response.json()).then(data => {
+                document.getElementById('temp').innerText = data.temperature.toFixed(1);
+                document.getElementById('humidity').innerText = data.humidity.toFixed(1);
+                document.getElementById('ldr').innerText = data.ldrValue;
+                document.getElementById('mq2').innerText = data.mq2Value;
+                document.getElementById('moist').innerText = data.moisture;
+                document.getElementById('lati').innerText = data.latitude;
+                document.getElementById('longi').innerText = data.longitude;
+                document.getElementById('pitch').innerText = data.pitch.toFixed(1);
+                document.getElementById('roll').innerText = data.roll.toFixed(1);
+                document.getElementById('yaw').innerText = data.yaw.toFixed(1);
+                updateCube(data.pitch, data.roll, data.yaw);
+
+            });
+        }, 1000);  // Update every second
+
+        function setMotorSpeed(motor,speed) {
+            fetch('/setSpeed' + motor + '?speed=' + speed);
+        }
+
+        function updateCube(pitch, roll, yaw) {
+            const cube = document.getElementById('cube');
+            cube.style.transform = 'rotateX(' + pitch + 'deg) rotateY(' + roll + 'deg) rotateZ(' + yaw + 'deg)';
+        }
+
+        function moveRobot(direction) {
+            fetch('/' + direction);
+        }
+        function sendServoCommand(direction) {
+  fetch(`/servo?dir=${direction}`)
+    .then(response => response.text())
+    .then(data => console.log('Servo:', data))
+    .catch(err => console.error('Servo command failed:', err));
+}
+
+    </script>
+</head>
+<body>
+    <div class='header'>
+        <h1>NATERIDA</h1>
+        <div class='footer'>Developed by TIWARI</div>
+    </div>
+    <div id='sensor-data'>
+        <div class='sensor-title'>Sensor Values</div>
+        <table class='sensor-table'>
+            <tr><th>DHT11 Temperature</th><th>DHT11 Humidity</th></tr>
+            <tr><td><span id='temp'>0</span> °C</td><td><span id='humidity'>0</span> %</td></tr>
+            <tr><th>LDR Value</th><th>MQ2 Value</th></tr>
+            <tr><td><span id='ldr'>0</span></td><td><span id='mq2'>0</span></td></tr>
+             <tr><th>Moisture</th><th>Distance</th></tr>
+            <tr><td><span id='moist'>0</span></td><td><span id='dist'>next version</span></td></tr>
+             <tr><th>Latitude</th><th>Longitude</th></tr>
+            <tr><td><span id='lati'>0</span></td><td><span id='longi'>0</span></td></tr>
+        </table>
+    </div>
+    <div class='control-container'>
+        <h2>Direction Control</h2>
+        <div class='direction-buttons'>
+            <div class='button-row'>
+                <button class='button' onclick="moveRobot('backward')">↓</button>
+            </div>
+            <div class='button-row'>
+                <button class='button' onclick="moveRobot('left')">←</button>
+                <div style='width: 30px;'></div>
+                <button class='button' onclick="moveRobot('stop')">Stop</button>
+                <div style='width: 30px;'></div>
+                <button class='button' onclick="moveRobot('right')">→</button>
+            </div>
+            <div class='button-row'>
+                <button class='button' onclick="moveRobot('forward')">↑</button>
+            </div>
+        </div>
+    </div>
+    <div id='cube-container'>
+        <h2>Robot Orientation</h2>
+        <div class='cube' id='cube'>
+            <div class='face front'></div>
+            <div class='face back'></div>
+            <div class='face left'></div>
+            <div class='face right'></div>
+            <div class='face top'></div>
+            <div class='face bottom'></div>
+        </div>
+        <div id='angles'>
+            <p>Pitch: <span id='pitch'>0</span>°</p>
+            <p>Roll: <span id='roll'>0</span>°</p>
+            <p>Yaw: <span id='yaw'>0</span>°</p>
+        </div>
+    </div>
+     <div id="speed-inputs">
+        <h2>Motor Speed Control</h2>
+        <form onsubmit="event.preventDefault(); setMotorSpeed(1, document.getElementById('speed1').value); setMotorSpeed(2, document.getElementById('speed2').value);">
+            <label for="speed1">Motor 1 Speed: </label>
+            <input type="number" id="speed1" min="0" max="255" value="200">
+            <label for="speed2">Motor 2 Speed: </label>
+            <input type="number" id="speed2" min="0" max="255" value="200">
+            <input type="submit" value="Set Speed">
+        </form>
+    </div>
+   <div class="speed-inputs">
+  <h3>Servo Control</h3>
+  <button onclick="sendServoCommand('up')">⬆️ Up</button>
+  <button onclick="sendServoCommand('down')">⬇️ Down</button>
+</div>
+
+</body>
+</html>
+)rawliteral");
+}
+
+// Control motor functions
+void moveForward() {
+  analogWrite(ena, speed1);
+  analogWrite(enb, speed2);
+  digitalWrite(motor1Pin1, HIGH);
+  digitalWrite(motor1Pin2, LOW);
+  digitalWrite(motor2Pin1, HIGH);
+  digitalWrite(motor2Pin2, LOW);
+  server.send(200, "text/html", "<h1>Moving Forward</h1><a href=\"/stop\">Stop</a>");
+}
+
+void moveBackward() {
+  analogWrite(ena, speed1);
+  analogWrite(enb, speed2);
+  digitalWrite(motor1Pin1, LOW);
+  digitalWrite(motor1Pin2, HIGH);
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, HIGH);
+  server.send(200, "text/html", "<h1>Moving Backward</h1><a href=\"/stop\">Stop</a>");
+}
+
+void turnLeft() {
+  analogWrite(ena, speed1);
+  analogWrite(enb, speed2);
+  digitalWrite(motor1Pin1, LOW);
+  digitalWrite(motor1Pin2, HIGH);
+  digitalWrite(motor2Pin1, HIGH);
+  digitalWrite(motor2Pin2, LOW);
+  server.send(200, "text/html", "<h1>Turning Left</h1><a href=\"/stop\">Stop</a>");
+}
+
+void turnRight() {
+  analogWrite(ena, speed1);
+  analogWrite(enb, speed2);
+  digitalWrite(motor1Pin1, HIGH);
+  digitalWrite(motor1Pin2, LOW);
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, HIGH);
+  server.send(200, "text/html", "<h1>Turning Right</h1><a href=\"/stop\">Stop</a>");
+}
+
+void stop() {
+  analogWrite(ena, 0);
+  analogWrite(enb, 0);
+  digitalWrite(motor1Pin1, LOW);
+  digitalWrite(motor1Pin2, LOW);
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, LOW);
+  server.send(200, "text/html", "<h1>Car Stopped</h1><a href=\"/\">Home</a>");
+}
+void setSpeed1() {
+    if (server.hasArg("speed")) {
+        speed1 = server.arg("speed").toInt();
+    }
+    server.send(200, "text/plain", "Speed1 set to " + String(speed1));
+}
+
+void setSpeed2() {
+    if (server.hasArg("speed")) {
+        speed2 = server.arg("speed").toInt();
+    }
+    server.send(200, "text/plain", "Speed2 set to " + String(speed2));
+}
+void servo_down(){
+  for (int angle = 10; angle <= 85; angle++) {
+    myServo.write(angle);
+    Serial.print("Angle: ");
+    Serial.println(angle);
+    delay(15);  // Adjust speed
+  }
+}
+void servo_up(){
+     for (int angle = 85; angle >= 0; angle--) {
+    myServo.write(angle);
+    Serial.print("Angle: ");
+    Serial.println(angle);
+    delay(15);  // Adjust speed
+  }
+}
+
+float pingSensorFast() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 15000);  // 15ms timeout
+  float distance = duration * 0.0343 / 2.0;
+
+  if (distance < MIN_VALID_DISTANCE_CM || distance > MAX_DISTANCE_CM) {
+    return -1.0f;
+  }
+
+  return distance;
+}
+
+void checkObstacleAndStop() {
+  if (millis() - lastObstacleCheck >= obstacleCheckInterval) {
+    lastObstacleCheck = millis();
+    float rawDist = pingSensorFast();
+    if (rawDist > 0) {
+      float smoothed = kalmanDist.filter(rawDist);
+      if (smoothed < 4.0) {
+        stop();  // This is your existing stop() function
+      }
+    }
+  }
+}
+
+void getSensorData() {
+  String jsonResponse = "{";
+  jsonResponse += "\"temperature\":" + String(sensorData.temperature, 2) + ",";
+  jsonResponse += "\"humidity\":" + String(sensorData.humidity, 2) + ",";
+  jsonResponse += "\"ldrValue\":" + String(sensorData.ldrValue) + ",";
+  jsonResponse += "\"mq2Value\":" + String(sensorData.mq2Value) + ",";
+  jsonResponse += "\"moisture\":" + String(sensorData.moisture) + ","; // FIXED: distanc -> distance
+  jsonResponse += "\"latitude\":" + String(sensorData.latitude, 6) + ",";
+  jsonResponse += "\"longitude\":" + String(sensorData.longitude, 6) + ",";
+  jsonResponse += "\"pitch\":" + String(sensorData.pitch, 2) + ",";
+  jsonResponse += "\"roll\":" + String(sensorData.roll, 2) + ",";
+  jsonResponse += "\"yaw\":" + String(sensorData.yaw, 2);
+  jsonResponse += "}";
+
+  server.send(200, "application/json", jsonResponse);
+}
