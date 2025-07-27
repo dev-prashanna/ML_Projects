@@ -1,0 +1,27 @@
+#include <ESP32Servo.h>
+
+Servo myServo;
+const int servoPin = 26;  // Connect your servo signal pin here
+
+void setup() {
+  Serial.begin(115200);
+  myServo.attach(servoPin);  // Attach servo to GPIO 13
+}
+
+void loop() {
+  // Sweep from 30 to 60 degrees
+  for (int angle = 10; angle <= 85; angle++) {
+    myServo.write(angle);
+    Serial.print("Angle: ");
+    Serial.println(angle);
+    delay(15);  // Adjust speed
+  }
+
+  // Sweep back from 60 to 30 degrees
+  for (int angle = 85; angle >= 0; angle--) {
+    myServo.write(angle);
+    Serial.print("Angle: ");
+    Serial.println(angle);
+    delay(15);  // Adjust speed
+  }
+}

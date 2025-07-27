@@ -1,0 +1,19 @@
+const int pirPin = 25;  // Connect PIR OUT to GPIO 25
+
+void setup() {
+  pinMode(pirPin, INPUT);
+  Serial.begin(115200);
+  Serial.println("PIR sensor warming up...");
+  delay(20000);  // Warm-up time for PIR (20 sec)
+  Serial.println("Ready.");
+}
+
+void loop() {
+  int state = digitalRead(pirPin);
+  if (state == HIGH) {
+    Serial.println("Motion detected!");
+  } else {
+    Serial.println("No motion.");
+  }
+  delay(1000);
+}

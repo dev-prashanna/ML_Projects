@@ -1,0 +1,67 @@
+#define TRIG_PIN 33
+#define ECHO_PIN 25
+#define MAX_DISTANCE_CM 400.0
+#define MIN_VALID_DISTANCE_CM 2.0
+
+// --- Kalman Filter Class ---
+class Kalman {
+  public:
+    Kalman() {
+      Q = 0.3f;    // Higher = faster response (less smoothing)
+      R = 1.0f;    // Lower = trust sensor more
+      P = 1.0f;
+      X = 0.0f;
+    }
+
+    float filter(float measurement) {
+      P = P + Q;
+      float K = P / (P + R);
+      X = X + K * (measurement - X);
+      P = (1 - K) * P;
+      return X;
+    }
+
+  private:
+    float Q, R, P, X;
+};
+
+Kalman kalman;
+
+// --- Fast Ultrasonic Read ---
+float pingSensorFast() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 15000);  // Timeout after 15ms (~2.5m)
+  float distance = duration * 0.0343 / 2.0;
+
+  if (distance < MIN_VALID_DISTANCE_CM || distance > MAX_DISTANCE_CM) {
+    return -1;  // Invalid
+  }
+
+  return distance;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  Serial.println("🔄 Real-Time HC-SR04 with Kalman Filtering");
+}
+
+void loop() {
+  float raw = pingSensorFast();
+  if (raw > 0) {
+    float filtered = kalman.filter(raw);
+    Serial.print("Smoothed Distance: ");
+    Serial.print(filtered, 2);
+    Serial.println(" cm");
+  } else {
+    Serial.println("⚠️ Out of range or error");
+  }
+
+  delay(10);  // Fast update rate (~100Hz)
+}

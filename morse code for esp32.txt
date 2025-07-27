@@ -1,0 +1,53 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+const char* ssid = "Prakash 2g";
+const char* password = "P1rakash@*#1";
+
+const int buzzerPin = 13;
+
+WebServer server(80);
+
+void playDot() {
+  tone(buzzerPin, 1000, 150);  // Short beep (dot)
+}
+
+void playDash() {
+  tone(buzzerPin, 800, 400);   // Long, lower tone (dash)
+}
+
+void handleMorse() {
+  if (server.hasArg("signal")) {
+    String signal = server.arg("signal");
+    if (signal == "dot") {
+      playDot();
+    } else if (signal == "dash") {
+      playDash();
+    }
+    server.send(200, "text/plain", "Signal Played");
+  } else {
+    server.send(400, "text/plain", "Missing signal parameter");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(buzzerPin, OUTPUT);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected: " + WiFi.localIP().toString());
+
+  server.on("/morse", handleMorse);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
+
+

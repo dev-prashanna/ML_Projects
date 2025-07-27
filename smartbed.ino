@@ -1,0 +1,493 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Servo.h>
+#include <math.h>
+
+// -------- Pin Definitions --------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define MQ2_PIN 34
+#define LDR_PIN 35
+#define IR_PIN 32
+#define TRIG_PIN 33
+#define ECHO_PIN 25
+#define BUZZER_PIN 13
+#define SERVO1_PIN 26
+#define SERVO2_PIN 27
+
+// -------- Objects --------
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_MPU6050 mpu;
+WebServer server(80);
+Servo servo1, servo2;
+
+// -------- WiFi Credentials --------
+const char* ssid = "Prakash 2g";
+const char* password = "P1rakash@*#1";
+
+// -------- Variables --------
+unsigned long lastSensorReadTime = 0;
+const unsigned long sensorReadInterval = 500;
+
+unsigned long lastBuzzerTime = 0;
+bool buzzerActive = false;
+
+// Jerk Detection
+float lastAx = 0, lastAy = 0;
+#define JERK_THRESHOLD 5
+
+// Time Tracking
+unsigned long bedStartTime = 0;
+unsigned long totalBedTime = 0;
+bool patientInBed = false;
+
+// Servo Angles
+int servo1Angle = 0;
+int servo2Angle = 90;
+
+// Sensor Data Struct
+struct SensorData {
+  float temperature;
+  float humidity;
+  int mq2Value;
+  int ldrValue;
+  float pitch, roll, yaw;
+  int bottleLevel;
+  unsigned long bedTime;
+};
+
+SensorData sensorData;
+
+// -------- HTML PAGE --------
+const char webpage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NATERIDA</title>
+  <style>
+   body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Courier New', monospace;
+            background-color: #000;
+            background-image: linear-gradient(to right, rgba(255, 0, 0, 0.2), rgba(0, 255, 0, 0.2), rgba(0, 0, 255, 0.2));
+            background-size: 200% 200%;
+            animation: gradientAnimation 8s ease infinite;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            height: 100vh;
+            overflow-y: auto;
+            text-shadow: 0 0 20px rgba(255, 255, 255, 0.8);
+        }
+
+        @keyframes gradientAnimation {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            margin: 20px 0;
+            flex-direction: column;
+        }
+            /* Progress bar styling for bottle level */
+.progress-container {
+    width: 80%;
+    background: rgba(0,255,0,0.1);
+    border: 2px solid #00ff00;
+    border-radius: 10px;
+    margin: 10px auto;
+    height: 25px;
+    overflow: hidden;
+}
+.progress-bar {
+    background: #00ff00;
+    height: 100%;
+    width: 0%;
+    transition: width 0.5s ease;
+}
+
+
+        h1 {
+            font-size: 3em;
+            animation: flicker 1s infinite;
+            margin: 0;
+            color: #00ff00;
+        }
+
+        @keyframes flicker {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+
+        .footer {
+            font-size: 1em;
+            animation: hackerEffect 1s infinite;
+            color: #00ffff;
+        }
+
+        @keyframes hackerEffect {
+            0%, 100% { opacity: 0.8; }
+            50% { opacity: 1; }
+        }
+
+        .sensor-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .sensor-table th, .sensor-table td {
+            border: 2px solid #00ff00;
+            padding: 10px;
+            text-align: center;
+            background-color: rgba(0, 255, 0, 0.2);
+        }
+
+        #sensor-data, #cube-container, .servo-control {
+            border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 10px;
+            text-align: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+
+        #cube {
+            width: 80px;
+            height: 80px;
+            background: rgba(255, 165, 0, 0.7);
+            position: relative;
+            transform-style: preserve-3d;
+            transition: transform 0.1s;
+            box-shadow: 0 0 20px rgba(255, 165, 0, 0.7);
+            margin: auto;
+        }
+
+        .face {
+            position: absolute;
+            width: 80px;
+            height: 80px;
+            background: rgba(255, 0, 0, 0.7);
+            border: 1px solid #fff;
+        }
+
+        .front { transform: translateZ(40px); }
+        .back { transform: rotateY(180deg) translateZ(40px); }
+        .left { transform: rotateY(-90deg) translateZ(40px); }
+        .right { transform: rotateY(90deg) translateZ(40px); }
+        .top { transform: rotateX(90deg) translateZ(40px); }
+        .bottom { transform: rotateX(-90deg) translateZ(40px); }
+
+        #angles { margin-top: 10px; font-size: 1.2em; color: #00ff00; }
+        .sensor-title { font-weight: bold; margin-bottom: 10px; animation: fadeIn 1s; }
+
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+        /* Servo slider styling */
+        .servo-control label {
+            display: block;
+            font-size: 1.2em;
+            margin-bottom: 5px;
+            color: #00ff00;
+        }
+
+        .servo-control input[type="range"] {
+            width: 80%;
+            margin: 10px 0;
+            -webkit-appearance: none;
+            height: 10px;
+            background: rgba(0, 255, 0, 0.2);
+            outline: none;
+            border-radius: 5px;
+            box-shadow: 0 0 10px #00ff00;
+        }
+
+        .servo-control input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 20px;
+            height: 20px;
+            background: #00ff00;
+            border-radius: 50%;
+            cursor: pointer;
+            box-shadow: 0 0 15px #00ff00;
+        }
+
+        @media (max-width: 600px) {
+            h1 { font-size: 2.5em; }
+            #angles { font-size: 1em; }
+        }
+  </style>
+  <script>
+    setInterval(function() {
+      fetch('/getSensorData').then(response => response.json()).then(data => {
+        document.getElementById('temp').innerText = data.temperature.toFixed(1);
+        document.getElementById('humidity').innerText = data.humidity.toFixed(1);
+        document.getElementById('ldr').innerText = data.ldrValue;
+        document.getElementById('mq2').innerText = data.mq2Value;
+        document.getElementById('pitch').innerText = data.pitch.toFixed(1);
+        document.getElementById('roll').innerText = data.roll.toFixed(1);
+        document.getElementById('yaw').innerText = data.yaw.toFixed(1);
+        document.getElementById('bedTime').innerText = Math.floor(data.bedTime/1000) + " sec";
+        updateCube(data.pitch, data.roll, data.yaw);
+      });
+    }, 1000);
+     // Bottle Level updates
+let level = data.bottleLevel;
+if(level < 0) {
+  document.getElementById('bottleLevelText').innerText = "No Reading";
+  document.getElementById('bottleLevelBar').style.width = "0%";
+} else {
+  document.getElementById('bottleLevelText').innerText = level + " cm";
+  let percent = Math.min(Math.max(100 - level, 0), 100);
+  document.getElementById('bottleLevelBar').style.width = percent + "%";
+}
+
+    function updateCube(pitch, roll, yaw) {
+      const cube = document.getElementById('cube');
+      cube.style.transform = 'rotateX(' + pitch + 'deg) rotateY(' + roll + 'deg) rotateZ(' + yaw + 'deg)';
+    }
+
+    function moveServo(servo, angle) {
+      fetch('/setServo?servo=' + servo + '&angle=' + angle)
+      .then(() => console.log('Servo ' + servo + ' set to ' + angle + '°'));
+    }
+  </script>
+</head>
+<body>
+   <div class='header'>
+        <h1>NATERIDA</h1>
+        <div class='footer'>Developed by Techengers</div>
+    </div>
+
+    <div id='sensor-data'>
+        <div class='sensor-title'>Sensor Values</div>
+        <table class='sensor-table'>
+            <tr><th>DHT11 Temperature</th><th>DHT11 Humidity</th></tr>
+            <tr><td><span id='temp'>0</span> °C</td><td><span id='humidity'>0</span> %</td></tr>
+            <tr><th>LDR Value</th><th>MQ2 Value</th></tr>
+            <tr><td><span id='ldr'>0</span></td><td><span id='mq2'>0</span></td></tr>
+            <tr><th colspan='2'>Bed Time</th></tr>
+            <tr><td colspan='2'><span id='bedTime'>0</span></td></tr>
+        </table>
+    </div>
+
+    <div id='cube-container'>
+        <h2>Robot Orientation</h2>
+        <div id='cube'>
+            <div class='face front'></div>
+            <div class='face back'></div>
+            <div class='face left'></div>
+            <div class='face right'></div>
+            <div class='face top'></div>
+            <div class='face bottom'></div>
+        </div>
+        <div id='angles'>
+            <p>Pitch: <span id='pitch'>0</span>°</p>
+            <p>Roll: <span id='roll'>0</span>°</p>
+            <p>Yaw: <span id='yaw'>0</span>°</p>
+        </div>
+    </div>
+
+    <!-- Servo control sliders -->
+    <div class="servo-control">
+        <h2>Bed angle control</h2>
+        <label for="servo1">Servo 1 (0°–90°)</label>
+        <input type="range" id="servo1" min="0" max="90" value="0" oninput="moveServo(1, this.value)">
+        <label for="servo2">Servo 2 (90°–180°)</label>
+        <input type="range" id="servo2" min="90" max="180" value="90" oninput="moveServo(2, this.value)">
+    </div>
+
+    <!-- Bottle water level -->
+<div id='bottle-container'>
+    <h2>Bottle Water Level</h2>
+    <div class="progress-container">
+        <div id="bottleLevelBar" class="progress-bar"></div>
+    </div>
+    <p><span id="bottleLevelText">0 cm</span></p>
+</div>
+
+</body>
+</html>
+)rawliteral";
+
+// -------- Function Prototypes --------
+void updateSensorData();
+int readUltrasonic();
+void setServoControl();
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+
+  pinMode(MQ2_PIN, INPUT);
+  pinMode(LDR_PIN, INPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // WiFi with timeout
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
+    Serial.print(".");
+    delay(500);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi Failed! Restarting...");
+    ESP.restart();
+  }
+  Serial.println("\nConnected! IP: ");
+  Serial.println(WiFi.localIP());
+
+  // MPU6050
+  Wire.begin(18, 5);
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 Failed!");
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // Servos
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(servo1Angle);
+  servo2.write(servo2Angle);
+
+  // Web server routes
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", webpage);
+  });
+
+  server.on("/getSensorData", HTTP_GET, []() {
+    String jsonResponse = "{\"temperature\":" + String(sensorData.temperature) +
+                          ",\"humidity\":" + String(sensorData.humidity) +
+                          ",\"ldrValue\":" + String(sensorData.ldrValue) +
+                          ",\"mq2Value\":" + String(sensorData.mq2Value) +
+                          ",\"pitch\":" + String(sensorData.pitch) +
+                          ",\"roll\":" + String(sensorData.roll) +
+                          ",\"yaw\":" + String(sensorData.yaw) +
+                          ",\"bedTime\":" + String(sensorData.bedTime) + "}";
+    server.send(200, "application/json", jsonResponse);
+  });
+
+  server.on("/setServo", HTTP_GET, setServoControl);
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  // Non-blocking buzzer handling
+  if (buzzerActive && millis() - lastBuzzerTime > 1000) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerActive = false;
+  }
+
+  if (millis() - lastSensorReadTime >= sensorReadInterval) {
+    updateSensorData();
+    lastSensorReadTime = millis();
+  }
+}
+
+// -------- Sensor Update --------
+void updateSensorData() {
+  // DHT11 with NAN check
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) sensorData.temperature = t;
+  if (!isnan(h)) sensorData.humidity = h;
+
+  // MQ2 & LDR
+  sensorData.mq2Value = analogRead(MQ2_PIN);
+  sensorData.ldrValue = analogRead(LDR_PIN);
+
+  // Bottle Level
+  sensorData.bottleLevel = readUltrasonic();
+
+  // MPU6050 jerk detection & orientation
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float dAx = abs(a.acceleration.x - lastAx);
+  float dAy = abs(a.acceleration.y - lastAy);
+  if (dAx > JERK_THRESHOLD && dAy > JERK_THRESHOLD) {
+    Serial.println("Jerk Detected!");
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerActive = true;
+    lastBuzzerTime = millis();
+  }
+  lastAx = a.acceleration.x;
+  lastAy = a.acceleration.y;
+
+  // Orientation calculation
+  sensorData.pitch = atan2(a.acceleration.y, sqrt(pow(a.acceleration.x, 2) + pow(a.acceleration.z, 2))) * 180 / PI;
+  sensorData.roll = atan2(-a.acceleration.x, a.acceleration.z) * 180 / PI;
+  sensorData.yaw = g.gyro.z * 180 / PI; // simplified
+
+  // IR Sensor for bed time tracking
+  bool irState = digitalRead(IR_PIN);
+  if (irState && !patientInBed) {
+    bedStartTime = millis();
+    patientInBed = true;
+  } else if (!irState && patientInBed) {
+    totalBedTime += millis() - bedStartTime;
+    patientInBed = false;
+  }
+  sensorData.bedTime = totalBedTime + (patientInBed ? millis() - bedStartTime : 0);
+
+  // Alert conditions (non-blocking buzzer)
+  if ((sensorData.temperature > 38 || sensorData.mq2Value > 1000) && !buzzerActive) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerActive = true;
+    lastBuzzerTime = millis();
+  }
+}
+
+// -------- Ultrasonic --------
+int readUltrasonic() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
+  if (duration == 0) return -1; // no object
+  return duration * 0.034 / 2; // cm
+}
+
+// -------- Servo Control from Web --------
+void setServoControl() {
+  if (server.hasArg("servo") && server.hasArg("angle")) {
+    int servoNum = server.arg("servo").toInt();
+    int angle = server.arg("angle").toInt();
+    if (servoNum == 1) {
+      servo1Angle = constrain(angle, 0, 90);
+      servo1.write(servo1Angle);
+    } else if (servoNum == 2) {
+      servo2Angle = constrain(angle, 90, 180);
+      servo2.write(servo2Angle);
+    }
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing parameters");
+  }
+}

@@ -1,0 +1,66 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// Pins
+#define SDA_PIN 18
+#define SCL_PIN 5
+#define BUZZER_PIN 13
+
+// Threshold for jerk detection (m/s²)
+#define JERK_THRESHOLD 5  
+
+Adafruit_MPU6050 mpu;
+
+sensors_event_t a, g, temp;
+float lastAx = 0, lastAy = 0, lastAz = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize I2C with custom SDA/SCL pins
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip!");
+    while (1) {
+      delay(10);
+    }
+  }
+  Serial.println("MPU6050 Found!");
+
+  // Setup buzzer pin
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Configure accelerometer and gyroscope
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  delay(100);
+}
+
+void loop() {
+  // Get current readings
+  mpu.getEvent(&a, &g, &temp);
+
+  // Calculate change in acceleration
+  float dAx = abs(a.acceleration.x - lastAx);
+  float dAy = abs(a.acceleration.y - lastAy);
+
+  // Trigger only if BOTH X and Y exceed threshold
+  if (dAx > JERK_THRESHOLD && dAy > JERK_THRESHOLD) {
+    Serial.println("Jerk Detected on BOTH X and Y!");
+    digitalWrite(BUZZER_PIN, HIGH);  // Turn ON buzzer
+    delay(5000);                     // Keep buzzer ON for 5 seconds
+    digitalWrite(BUZZER_PIN, LOW);   // Turn OFF buzzer
+  }
+
+  // Store last readings
+  lastAx = a.acceleration.x;
+  lastAy = a.acceleration.y;
+
+  delay(100);  // Adjust sample rate
+}

@@ -1,0 +1,385 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <MPU6050.h>
+#include <math.h>
+
+// DHT Sensor settings
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// MQ2 settings
+const int mq2Pin = 34;
+
+// LDR settings
+const int ldrPin = 35;
+
+// Wi-Fi credentials
+const char* ssid = "Prakash 2g";
+const char* password = "P1rakash@*#1";
+
+WebServer server(80);
+MPU6050 mpu;
+
+// Timer variables
+unsigned long lastSensorReadTime = 0;
+const unsigned long sensorReadInterval = 100; // 100 ms
+float lastTime = 0; // Last time the loop was executed
+
+// Sensor data structure
+struct SensorData {
+  float temperature;
+  float humidity;
+  int mq2Value;
+  int ldrValue;
+  float pitch;
+  float roll;
+  float yaw;
+};
+
+SensorData sensorData;
+
+void setup() {
+  Serial.begin(115200);
+  // Initialize DHT sensor
+  dht.begin();
+  
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(100);
+  }
+  Serial.println("Connected to WiFi");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Initialize I2C for MPU6050
+  Wire.begin(18, 5);
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed");
+  }
+
+  // Define web server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/forward", HTTP_GET, moveForward);
+  server.on("/backward", HTTP_GET, moveBackward);
+  server.on("/left", HTTP_GET, turnLeft);
+  server.on("/right", HTTP_GET, turnRight);
+  server.on("/stop", HTTP_GET, stop);
+  server.on("/getSensorData", HTTP_GET, getSensorData);
+  server.on("/",handleRoot);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  
+  // Update sensor data at regular intervals
+  if (millis() - lastSensorReadTime >= sensorReadInterval) {
+    updateSensorData();
+    lastSensorReadTime = millis();
+  }
+}
+
+void updateSensorData() {
+  // Read the value from the LDR
+  sensorData.ldrValue = analogRead(ldrPin);
+  
+  // Read the value from the MQ-2 sensor
+  sensorData.mq2Value = analogRead(mq2Pin);
+  
+  // Read DHT sensor readings
+  sensorData.temperature = dht.readTemperature();
+  sensorData.humidity = dht.readHumidity();
+  
+  // Check if any reads failed
+  if (isnan(sensorData.humidity) || isnan(sensorData.temperature)) {
+    Serial.println("Failed to read from DHT sensor!");
+    return;  // Exit if reading fails
+  }
+  
+  // Read accelerometer and gyroscope values
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  
+  // Calculate pitch and roll from accelerometer
+  sensorData.pitch = atan2(ay, az) * 180.0 / M_PI;
+  sensorData.roll = atan2(ax, az) * 180.0 / M_PI;
+
+  // Simple integration of yaw
+  float currentTime = millis();
+  float dt = (currentTime - lastTime) / 1000;  // Convert to seconds
+  sensorData.yaw += (gz / 131.0) * dt;  // Update yaw
+  lastTime = currentTime;
+}
+
+// Handle root request
+void handleRoot() {
+  server.send(200, "text/html", R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NATERIDA</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Courier New', monospace;
+            background-color: #000;
+            background-image: linear-gradient(to right, rgba(255, 0, 0, 0.2), rgba(0, 255, 0, 0.2), rgba(0, 0, 255, 0.2));
+            background-size: 200% 200%;
+            animation: gradientAnimation 8s ease infinite;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            height: 100vh;
+            overflow-y: auto;
+            text-shadow: 0 0 20px rgba(255, 255, 255, 0.8);
+        }
+
+        @keyframes gradientAnimation {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            margin: 20px 0;
+            flex-direction: column;
+        }
+
+        h1 {
+            font-size: 3em;
+            animation: flicker 1s infinite;
+            margin: 0;
+            color: #00ff00;
+        }
+
+        @keyframes flicker {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+
+        .footer {
+            font-size: 1em;
+            animation: hackerEffect 1s infinite;
+            color: #00ffff;
+        }
+
+        @keyframes hackerEffect {
+            0%, 100% { opacity: 0.8; }
+            50% { opacity: 1; }
+        }
+
+        .button {
+            background-color: rgba(0, 0, 0, 0.8);
+            border: 2px solid #00ff00;
+            color: #00ff00;
+            padding: 15px 25px;
+            margin: 5px;
+            transition: background-color 0.4s, transform 0.4s, box-shadow 0.4s;
+            cursor: pointer;
+            border-radius: 12px;
+            box-shadow: 0 0 15px #00ff00, 0 0 30px #00ff00, 0 0 45px #00ff00;
+            font-size: 1.5em;
+            min-width: 100px;
+            animation: pulse 1s infinite alternate;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            100% { transform: scale(1.1); }
+        }
+
+        .button:hover {
+            background-color: rgba(0, 255, 0, 0.5);
+            transform: scale(1.1);
+            box-shadow: 0 0 25px #00ff00, 0 0 50px #00ff00, 0 0 75px #00ff00;
+        }
+
+        .control-container {
+            border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 10px;
+            text-align: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+
+        #cube-container {
+            margin: 10px;
+            border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+
+        #cube {
+            width: 80px;
+            height: 80px;
+            background: rgba(255, 165, 0, 0.7);
+            position: relative;
+            transform-style: preserve-3d;
+            transition: transform 0.1s;
+            box-shadow: 0 0 20px rgba(255, 165, 0, 0.7);
+        }
+
+        .face {
+            position: absolute;
+            width: 80px;
+            height: 80px;
+            background: rgba(255, 0, 0, 0.7);
+            border: 1px solid #fff;
+        }
+
+        .front { transform: translateZ(40px); }
+        .back { transform: rotateY(180deg) translateZ(40px); }
+        .left { transform: rotateY(-90deg) translateZ(40px); }
+        .right { transform: rotateY(90deg) translateZ(40px); }
+        .top { transform: rotateX(90deg) translateZ(40px); }
+        .bottom { transform: rotateX(-90deg) translateZ(40px); }
+
+        #angles { margin-top: 10px; font-size: 1.2em; color: #00ff00; }
+        #sensor-data { margin-top: 10px; font-size: 1em; text-align: center; color: #00ff00; width: 90%; }
+        .sensor-title { font-weight: bold; margin-bottom: 10px; animation: fadeIn 1s; }
+
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        
+        .sensor-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .sensor-table th, .sensor-table td {
+            border: 2px solid #00ff00;
+            padding: 10px;
+            text-align: center;
+            background-color: rgba(0, 255, 0, 0.2);
+        }
+
+        footer { position: absolute; bottom: 10px; }
+        
+        .direction-buttons {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+        }
+
+        .direction-buttons .button-row {
+            display: flex;
+            justify-content: center;
+            flex-direction: row;
+        }
+
+        @media (max-width: 600px) {
+            h1 { font-size: 2.5em; }
+            .button { font-size: 1em; }
+            #angles { font-size: 1em; }
+        }
+        #speed-inputs{
+           border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 10px;
+            text-align: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+        #morse-code{
+            border: 2px solid #00ff00;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 10px;
+            text-align: center;
+            width: 90%;
+            background-color: rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 20px #00ff00;
+        }
+    </style>
+    <script>
+        setInterval(function() {
+            fetch('/getSensorData').then(response => response.json()).then(data => {
+                document.getElementById('temp').innerText = data.temperature.toFixed(1);
+                document.getElementById('humidity').innerText = data.humidity.toFixed(1);
+                document.getElementById('ldr').innerText = data.ldrValue;
+                document.getElementById('mq2').innerText = data.mq2Value;
+                document.getElementById('pitch').innerText = data.pitch.toFixed(1);
+                document.getElementById('roll').innerText = data.roll.toFixed(1);
+                document.getElementById('yaw').innerText = data.yaw.toFixed(1);
+                updateCube(data.pitch, data.roll, data.yaw);
+            });
+        }, 1000);  // Update every second
+
+        function updateCube(pitch, roll, yaw) {
+            const cube = document.getElementById('cube');
+            cube.style.transform = 'rotateX(' + pitch + 'deg) rotateY(' + roll + 'deg) rotateZ(' + yaw + 'deg)';
+        }
+    </script>
+</head>
+<body>
+    <div class='header'>
+        <h1>NATERIDA</h1>
+        <div class='footer'>Developed by Techengers</div>
+    </div>
+    <div id='sensor-data'>
+        <div class='sensor-title'>Sensor Values</div>
+        <table class='sensor-table'>
+            <tr><th>DHT11 Temperature</th><th>DHT11 Humidity</th></tr>
+            <tr><td><span id='temp'>0</span> °C</td><td><span id='humidity'>0</span> %</td></tr>
+            <tr><th>LDR Value</th><th>MQ2 Value</th></tr>
+            <tr><td><span id='ldr'>0</span></td><td><span id='mq2'>0</span></td></tr>
+        </table>
+    </div>
+    <div id='cube-container'>
+        <h2>Robot Orientation</h2>
+        <div class='cube' id='cube'>
+            <div class='face front'></div>
+            <div class='face back'></div>
+            <div class='face left'></div>
+            <div class='face right'></div>
+            <div class='face top'></div>
+            <div class='face bottom'></div>
+        </div>
+        <div id='angles'>
+            <p>Pitch: <span id='pitch'>0</span>°</p>
+            <p>Roll: <span id='roll'>0</span>°</p>
+            <p>Yaw: <span id='yaw'>0</span>°</p>
+        </div>
+    </div>
+</body>
+</html>
+)rawliteral");
+}
+
+// Function to get sensor data
+void getSensorData() {
+  String jsonResponse = "{\"temperature\":" + String(sensorData.temperature) +
+                        ", \"humidity\":" + String(sensorData.humidity) +
+                        ", \"ldrValue\":" + String(sensorData.ldrValue) +
+                        ", \"mq2Value\":" + String(sensorData.mq2Value) +
+                        ", \"pitch\":" + String(sensorData.pitch) +
+                        ", \"roll\":" + String(sensorData.roll) +
+                        ", \"yaw\":" + String(sensorData.yaw) + "}";
+  server.send(200, "application/json", jsonResponse);
+}

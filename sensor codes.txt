@@ -1,0 +1,95 @@
+#include <DHT.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+// === Kalman Filter Class ===
+class Kalman {
+  public:
+    Kalman() {
+      Q = 0.001f;
+      R = 1.0f;
+      P = 1.0f;
+      X = 0.0f;
+    }
+
+    float filter(float measurement) {
+      P = P + Q;
+      float K = P / (P + R);
+      X = X + K * (measurement - X);
+      P = (1 - K) * P;
+      return X;
+    }
+
+  private:
+    float Q, R, P, X;
+};
+
+// === Pin Definitions ===
+#define MQ2_PIN      34
+#define LDR_PIN      35
+#define MOISTURE_PIN 32
+#define DHT_PIN      4
+#define DHTTYPE      DHT11
+
+DHT dht(DHT_PIN, DHTTYPE);
+
+// === GPS Setup (RX2 = 16, TX2 = 17) ===
+HardwareSerial GPSSerial(2);
+TinyGPSPlus gps;
+
+// === Kalman Filters for each sensor ===
+Kalman k_mq2, k_ldr, k_moisture;
+Kalman k_temp, k_humidity;
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+
+  // GPS UART2 init: RX=16 (GPS TX), TX=17 (optional)
+  GPSSerial.begin(9600, SERIAL_8N1, 16, 17);
+
+  delay(2000);
+  Serial.println("All sensors initialized.");
+}
+
+void loop() {
+  // --- Read Analog Sensors ---
+  int raw_mq2       = analogRead(MQ2_PIN);
+  int raw_ldr       = analogRead(LDR_PIN);
+  int raw_moisture  = analogRead(MOISTURE_PIN);
+
+  float mq2         = k_mq2.filter(raw_mq2);
+  float ldr         = k_ldr.filter(raw_ldr);
+  float moisture    = k_moisture.filter(raw_moisture);
+
+  // --- Read DHT11 ---
+  float raw_temp    = dht.readTemperature();
+  float raw_humid   = dht.readHumidity();
+
+  float temp        = k_temp.filter(raw_temp);
+  float humidity    = k_humidity.filter(raw_humid);
+
+  // --- Read GPS ---
+  while (GPSSerial.available()) {
+    gps.encode(GPSSerial.read());
+  }
+
+  // --- Print All Sensor Data ---
+  Serial.println("------ Sensor Readings (Every 500ms) ------");
+  Serial.print("MQ2 (Gas): "); Serial.print(mq2, 1); Serial.print(" / 4095\t");
+  Serial.print("LDR (Light): "); Serial.print(ldr, 1); Serial.print(" / 4095\t");
+  Serial.print("Moisture: "); Serial.print(moisture, 1); Serial.println(" / 4095");
+
+  Serial.print("Temp (°C): "); Serial.print(temp, 1); Serial.print("\t");
+  Serial.print("Humidity (%): "); Serial.println(humidity, 1);
+
+  if (gps.location.isUpdated()) {
+    Serial.print("GPS Lat: "); Serial.print(gps.location.lat(), 6); Serial.print("\t");
+    Serial.print("Long: "); Serial.println(gps.location.lng(), 6);
+  } else {
+    Serial.println("GPS: Waiting for fix...");
+  }
+
+  Serial.println("------------------------------------------");
+  delay(500);  // Every 500ms
+}

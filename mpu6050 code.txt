@@ -1,0 +1,103 @@
+#include <Wire.h>
+#include <MPU6050_light.h>
+
+// Kalman filter class (embedded)
+class Kalman {
+public:
+  Kalman() {
+    Q_angle = 0.001f;
+    Q_bias = 0.003f;
+    R_measure = 0.03f;
+    angle = 0.0f;
+    bias = 0.0f;
+    P[0][0] = P[0][1] = P[1][0] = P[1][1] = 0.0f;
+  }
+
+  float getAngle(float newAngle, float newRate, float dt) {
+    rate = newRate - bias;
+    angle += dt * rate;
+
+    P[0][0] += dt * (dt*P[1][1] - P[0][1] - P[1][0] + Q_angle);
+    P[0][1] -= dt * P[1][1];
+    P[1][0] -= dt * P[1][1];
+    P[1][1] += Q_bias * dt;
+
+    float S = P[0][0] + R_measure;
+    float K[2];
+    K[0] = P[0][0] / S;
+    K[1] = P[1][0] / S;
+
+    float y = newAngle - angle;
+    angle += K[0] * y;
+    bias += K[1] * y;
+
+    float P00_temp = P[0][0];
+    float P01_temp = P[0][1];
+
+    P[0][0] -= K[0] * P00_temp;
+    P[0][1] -= K[0] * P01_temp;
+    P[1][0] -= K[1] * P00_temp;
+    P[1][1] -= K[1] * P01_temp;
+
+    return angle;
+  }
+
+private:
+  float Q_angle, Q_bias, R_measure;
+  float angle, bias, rate;
+  float P[2][2];
+};
+
+// ESP32 I2C pin config
+#define SDA_PIN 18
+#define SCL_PIN 5
+
+MPU6050 mpu(Wire);
+Kalman kalmanX, kalmanY;
+
+unsigned long timer = 0;
+double kalAngleX, kalAngleY;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  byte status = mpu.begin();
+  while (status != 0) {
+    Serial.print("MPU6050 init failed. Status: "); Serial.println(status);
+    delay(1000);
+    status = mpu.begin();
+  }
+
+  Serial.println("MPU6050 connected!");
+  mpu.calcOffsets(true, true); // Calibrate both gyro and accel
+
+  Serial.println("Calibration complete.");
+  timer = micros();
+}
+
+void loop() {
+  mpu.update();
+
+  double dt = (double)(micros() - timer) / 1000000.0;
+  timer = micros();
+
+  // Raw angles
+  double rawRoll = mpu.getAngleX();
+  double rawPitch = mpu.getAngleY();
+  double rawYaw = mpu.getAngleZ(); // Gyro-integrated
+
+  // Kalman filtered
+  kalAngleX = kalmanX.getAngle(rawRoll, mpu.getGyroX(), dt);
+  kalAngleY = kalmanY.getAngle(rawPitch, mpu.getGyroY(), dt);
+
+  // Print every 50ms
+  static unsigned long printTimer = 0;
+  if (millis() - printTimer >= 50) {
+    printTimer = millis();
+
+    Serial.print("Pitch (Kalman): "); Serial.print(kalAngleY, 2); Serial.print(" °\t");
+    Serial.print("Roll (Kalman): "); Serial.print(kalAngleX, 2); Serial.print(" °\t");
+    Serial.print("Yaw (Raw): "); Serial.print(rawYaw, 2); Serial.println(" °");
+  }
+}
